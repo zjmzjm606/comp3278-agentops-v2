@@ -7,15 +7,15 @@ This project is designed for the COMP3278 final project: it is a real web app wi
 ## What the app does
 
 - Create and manage projects.
-- Create tasks with required specialist roles and task dependencies.
+- Create, edit and delete tasks with required specialist roles and task dependencies.
 - Register Mock or Live AI agents.
 - Recommend the best available agent for a task.
 - Detect likely duplicate tasks by text similarity (computed on demand, not stored).
 - Generate a risk score for a task (computed on demand, not stored).
-- Run the next eligible task through an agent.
-- Store agent run status, latency, model name and raw output.
+- Run the next eligible task through an agent. The agent receives the approved artifacts of the task's prerequisites as input, and the database records which ones it used.
+- Store agent run status, latency, model name and raw output. Starting and finishing a run are transactional, so concurrent clicks cannot start the same task twice.
 - Store generated artifacts and show their contents.
-- Record human review/approval decisions.
+- Record human review/approval decisions. A task only reaches `DONE` by approving an agent's artifact; it cannot be set to `DONE` directly.
 - Display an execution dashboard and run history.
 
 ## Tech stack
@@ -151,11 +151,12 @@ A second seeded account is `bob@example.com` with the same demo password.
 2. Open the seeded **AgentOps Demo Project**.
 3. Open **Tasks**.
 4. Create a task or run the next eligible task.
-5. Click **Recommend agent** to compute an assignee and risk recommendation (shown in the Recommendations card; not stored).
-6. Click **Run agent** to execute the task through the selected specialist.
-7. Open **Run history** and inspect the agent run and generated artifact.
-8. Approve a task in `REVIEW` status to mark it `DONE`.
-9. Confirm in MySQL that task status, runs, artifacts and reviews changed.
+5. Click **Edit** on a task to change its title, priority or status (only `TODO`, `BLOCKED` and `CANCELLED` can be chosen directly).
+6. Click **Recommend agent** to compute an assignee and risk recommendation (shown in the Recommendations card; not stored).
+7. Click **Run agent** to execute the task through the selected specialist.
+8. Open **Run history** and inspect the agent run, its **Inputs** (approved upstream artifacts it used) and the generated artifact.
+9. Approve a task in `REVIEW` status to mark it `DONE`.
+10. Confirm in MySQL that task status, runs, run inputs, artifacts and reviews changed.
 
 The project is intentionally human-in-the-loop: after a non-reviewer task finishes, it enters `REVIEW`; a human must approve it before dependent tasks can run.
 
@@ -204,10 +205,11 @@ If a Live provider is selected without a key, the run fails clearly and the erro
 | `tasks` | Entity | `task_id` | Project tasks and current state |
 | `agents` | Entity | `agent_id` | Planner, coder, tester and reviewer agents |
 | `agent_runs` | Entity | `agent_run_id` | Execution history, latency, status and raw output |
-| `artifacts` | Entity | `artifact_id` | Files or Markdown output produced by agents |
+| `artifacts` | Entity | `artifact_id` | Files or Markdown output produced by agents (the task is derived through `agent_runs`) |
 | `reviews` | Entity | `review_id` | Human review decisions |
 | `task_dependencies` | Relationship (recursive M:N on tasks) | `(task_id, depends_on_task_id)` | Which tasks must finish before another can run |
-| `task_assignments` | Relationship (M:N tasks–agents) | `(task_id, agent_id, assignment_role)` | Agents assigned to tasks, with their role |
+| `task_assignments` | Relationship (M:N tasks–agents) | `(task_id, agent_id, assignment_role)` | Agents assigned to tasks, with their role; at most one `PRIMARY` per task |
+| `run_inputs` | Relationship (M:N agent_runs–artifacts) | `(agent_run_id, artifact_id)` | Approved upstream artifacts that a run used as input |
 
 Every entity's primary key is prefixed with its table name, so foreign keys share the name of the key they reference (for example `tasks.project_id → projects.project_id`).
 

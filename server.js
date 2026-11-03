@@ -77,6 +77,14 @@ const AGENT_STATUSES = new Set(['AVAILABLE', 'BUSY', 'OFFLINE']);
 const AGENT_MODES = new Set(['MOCK', 'LIVE']);
 const AGENT_PROVIDERS = new Set(['mock', 'openai', 'deepseek', 'glm']);
 
+// Status changes a user may make directly. IN_PROGRESS, REVIEW and DONE are only
+// reached through the workflow: running an agent and approving its artifact.
+const MANUAL_STATUS_TRANSITIONS = {
+  TODO: ['BLOCKED', 'CANCELLED'],
+  BLOCKED: ['TODO', 'CANCELLED'],
+  CANCELLED: ['TODO']
+};
+
 async function getProjectForUser(projectId, userId) {
   const [rows] = await pool.execute(
     `SELECT p.*, u.username AS owner_name
@@ -380,10 +388,11 @@ app.patch(
   '/api/tasks/:taskId',
   asyncHandler(async (req, res) => {
     const taskId = idFrom(req.params.taskId, 'taskId');
-    await getTaskForUser(taskId, req.session.userId);
+    const current = await getTaskForUser(taskId, req.session.userId);
 
     const updates = [];
     const values = [];
+    let statusChange = null;
     if (req.body.title !== undefined) {
       updates.push('title = ?');
       values.push(requiredText(req.body.title, 'Task title', 200));
@@ -392,10 +401,21 @@ app.patch(
       updates.push('description = ?');
       values.push(String(req.body.description || '').trim() || null);
     }
-    if (req.body.status !== undefined) {
+    if (req.body.status !== undefined && req.body.status !== current.status) {
       if (!TASK_STATUSES.has(req.body.status)) throw new AppError(400, 'Invalid task status.', 'VALIDATION_ERROR');
+      const allowed = MANUAL_STATUS_TRANSITIONS[current.status] || [];
+      if (!allowed.includes(req.body.status)) {
+        throw new AppError(
+          409,
+          `Cannot change status from ${current.status} to ${req.body.status} directly. ` +
+            'IN_PROGRESS, REVIEW and DONE are set by running an agent and approving its artifact.',
+          'INVALID_STATUS_TRANSITION',
+          { from: current.status, allowed }
+        );
+      }
       updates.push('status = ?');
       values.push(req.body.status);
+      statusChange = { from: current.status, to: req.body.status };
     }
     if (req.body.priority !== undefined) {
       if (!TASK_PRIORITIES.has(req.body.priority)) throw new AppError(400, 'Invalid priority.', 'VALIDATION_ERROR');
@@ -420,7 +440,16 @@ app.patch(
     if (!updates.length) throw new AppError(400, 'No supported fields supplied.', 'VALIDATION_ERROR');
 
     values.push(taskId);
-    await pool.execute(`UPDATE tasks SET ${updates.join(', ')} WHERE task_id = ?`, values);
+    let where = 'task_id = ?';
+    if (statusChange) {
+      // Only apply the change if nobody moved the task in the meantime (e.g. a run started).
+      where += ' AND status = ?';
+      values.push(statusChange.from);
+    }
+    const [result] = await pool.execute(`UPDATE tasks SET ${updates.join(', ')} WHERE ${where}`, values);
+    if (statusChange && result.affectedRows !== 1) {
+      throw new AppError(409, 'The task changed while you were editing it. Refresh and try again.', 'TASK_CHANGED');
+    }
     const [rows] = await pool.execute('SELECT * FROM tasks WHERE task_id = ?', [taskId]);
     res.json({ task: rows[0] });
   })
@@ -505,11 +534,21 @@ app.get(
          a.role AS agent_role,
          ar.artifact_id,
          ar.file_name,
-         ar.artifact_type
+         ar.artifact_type,
+         COALESCE(inp.input_count, 0) AS input_count,
+         inp.input_files
        FROM agent_runs r
        JOIN tasks t ON t.task_id = r.task_id
        JOIN agents a ON a.agent_id = r.agent_id
        LEFT JOIN artifacts ar ON ar.agent_run_id = r.agent_run_id
+       LEFT JOIN (
+         SELECT ri.agent_run_id,
+                COUNT(*) AS input_count,
+                GROUP_CONCAT(ia.file_name ORDER BY ia.artifact_id SEPARATOR ', ') AS input_files
+         FROM run_inputs ri
+         JOIN artifacts ia ON ia.artifact_id = ri.artifact_id
+         GROUP BY ri.agent_run_id
+       ) inp ON inp.agent_run_id = r.agent_run_id
        WHERE t.project_id = ?
        ORDER BY r.created_at DESC, r.agent_run_id DESC
        LIMIT 100`,
@@ -527,6 +566,7 @@ app.get(
     const [rows] = await pool.execute(
       `SELECT
          ar.*,
+         r.task_id,
          t.title AS task_title,
          r.agent_id,
          a.name AS agent_name,
@@ -534,8 +574,8 @@ app.get(
          rev.status AS review_status,
          rev.comment AS review_comment
        FROM artifacts ar
-       JOIN tasks t ON t.task_id = ar.task_id
        JOIN agent_runs r ON r.agent_run_id = ar.agent_run_id
+       JOIN tasks t ON t.task_id = r.task_id
        JOIN agents a ON a.agent_id = r.agent_id
        LEFT JOIN reviews rev ON rev.artifact_id = ar.artifact_id
        WHERE t.project_id = ?

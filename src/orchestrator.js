@@ -160,10 +160,76 @@ async function recommendAssignee(taskId) {
   return { task, best, candidates, risk: { score: riskScore, reason: riskReason } };
 }
 
+const RUNNABLE_STATUSES = ['TODO', 'BLOCKED', 'REVIEW'];
+
+// The latest approved artifact of each direct prerequisite task. A run receives these
+// as input, and the usage is recorded in the run_inputs relationship.
+async function getApprovedInputs(taskId, executor = pool) {
+  const [rows] = await executor.execute(
+    `SELECT task_id, task_title, artifact_id, artifact_type, file_name, content
+     FROM (
+       SELECT
+         dep.task_id,
+         dep.title AS task_title,
+         ar.artifact_id,
+         ar.artifact_type,
+         ar.file_name,
+         ar.content,
+         ROW_NUMBER() OVER (
+           PARTITION BY dep.task_id
+           ORDER BY ar.created_at DESC, ar.artifact_id DESC
+         ) AS rn
+       FROM task_dependencies td
+       JOIN tasks dep ON dep.task_id = td.depends_on_task_id
+       JOIN agent_runs r ON r.task_id = dep.task_id AND r.status = 'SUCCESS'
+       JOIN artifacts ar ON ar.agent_run_id = r.agent_run_id
+       WHERE td.task_id = ?
+         AND EXISTS (
+           SELECT 1 FROM reviews rv
+           WHERE rv.artifact_id = ar.artifact_id AND rv.status = 'ACCEPTED'
+         )
+     ) latest
+     WHERE rn = 1
+     ORDER BY task_id`,
+    [taskId]
+  );
+  return rows;
+}
+
+// Close a run that could not finish: the run, the agent and the task are updated
+// together so none of them is left RUNNING / BUSY / IN_PROGRESS.
+async function finishFailedRun(runId, agentId, taskId, latencyMs, message) {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.execute(
+      `UPDATE agent_runs
+       SET status = 'FAILED', finished_at = NOW(), latency_ms = ?, error_message = ?
+       WHERE agent_run_id = ? AND status = 'RUNNING'`,
+      [latencyMs, String(message).slice(0, 2000), runId]
+    );
+    await connection.execute(
+      `UPDATE agents SET status = 'AVAILABLE' WHERE agent_id = ? AND status = 'BUSY'`,
+      [agentId]
+    );
+    await connection.execute(
+      `UPDATE tasks SET status = 'BLOCKED' WHERE task_id = ? AND status = 'IN_PROGRESS'`,
+      [taskId]
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 async function runTask(taskId, requestedAgentId = null) {
   const task = await getTaskContext(taskId);
   if (task.status === 'DONE') throw new AppError(409, 'Task is already done.', 'TASK_DONE');
   if (task.status === 'CANCELLED') throw new AppError(409, 'Task is cancelled.', 'TASK_CANCELLED');
+  if (task.status === 'IN_PROGRESS') throw new AppError(409, 'Task is already running.', 'TASK_RUNNING');
 
   const blocking = await getBlockingDependencies(taskId);
   if (blocking.length) {
@@ -175,59 +241,110 @@ async function runTask(taskId, requestedAgentId = null) {
     );
   }
 
-  let agent = null;
+  let candidates;
   if (requestedAgentId) {
     const [rows] = await pool.execute('SELECT * FROM agents WHERE agent_id = ?', [requestedAgentId]);
-    agent = rows[0];
-    if (!agent) throw new AppError(404, 'Agent not found.', 'AGENT_NOT_FOUND');
-    if (agent.role !== task.required_role) {
+    const requested = rows[0];
+    if (!requested) throw new AppError(404, 'Agent not found.', 'AGENT_NOT_FOUND');
+    if (requested.role !== task.required_role) {
       throw new AppError(
         400,
-        `Agent role ${agent.role} does not match required role ${task.required_role}.`,
+        `Agent role ${requested.role} does not match required role ${task.required_role}.`,
         'ROLE_MISMATCH'
       );
     }
-    if (agent.status !== 'AVAILABLE') {
-      throw new AppError(409, `Agent is currently ${agent.status.toLowerCase()}.`, 'AGENT_UNAVAILABLE');
+    if (requested.status !== 'AVAILABLE') {
+      throw new AppError(409, `Agent is currently ${requested.status.toLowerCase()}.`, 'AGENT_UNAVAILABLE');
     }
+    candidates = [requested];
   } else {
-    const recommendation = await recommendAssignee(taskId);
-    agent = recommendation.best;
+    // May be empty; the claim below reports TASK_RUNNING or NO_AGENT accordingly.
+    candidates = await scoreAgents(task);
   }
 
-  const [runResult] = await pool.execute(
-    `INSERT INTO agent_runs
-       (task_id, agent_id, status, started_at, input_summary, model_name)
-     VALUES (?, ?, 'RUNNING', NOW(), ?, ?)`,
-    [taskId, agent.agent_id, `${task.title}: ${task.description || 'No description'}`, agent.model_name]
-  );
-  const runId = runResult.insertId;
+  const inputs = await getApprovedInputs(taskId);
 
-  await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['BUSY', agent.agent_id]);
-  await pool.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['IN_PROGRESS', taskId]);
+  // 1. Claim the task and one agent in a single transaction. The conditional UPDATEs
+  //    only succeed if the row is still in the expected state, so two concurrent
+  //    requests cannot start the same task or book the same agent twice.
+  let agent = null;
+  let runId;
+  const claim = await pool.getConnection();
+  try {
+    await claim.beginTransaction();
 
+    const placeholders = RUNNABLE_STATUSES.map(() => '?').join(', ');
+    const [claimedTask] = await claim.execute(
+      `UPDATE tasks SET status = 'IN_PROGRESS'
+       WHERE task_id = ? AND status IN (${placeholders})`,
+      [taskId, ...RUNNABLE_STATUSES]
+    );
+    if (claimedTask.affectedRows !== 1) {
+      throw new AppError(409, 'Task is no longer runnable; another run may have started.', 'TASK_RUNNING');
+    }
+
+    for (const candidate of candidates) {
+      const [claimedAgent] = await claim.execute(
+        `UPDATE agents SET status = 'BUSY' WHERE agent_id = ? AND status = 'AVAILABLE'`,
+        [candidate.agent_id]
+      );
+      if (claimedAgent.affectedRows === 1) {
+        agent = candidate;
+        break;
+      }
+    }
+    if (!agent) {
+      throw requestedAgentId
+        ? new AppError(409, 'Agent is no longer available.', 'AGENT_UNAVAILABLE')
+        : new AppError(409, `No available agent for role ${task.required_role}.`, 'NO_AGENT');
+    }
+
+    const [runResult] = await claim.execute(
+      `INSERT INTO agent_runs
+         (task_id, agent_id, status, started_at, input_summary, model_name)
+       VALUES (?, ?, 'RUNNING', NOW(), ?, ?)`,
+      [
+        taskId,
+        agent.agent_id,
+        `${task.title}: ${task.description || 'No description'}` +
+          (inputs.length ? ` | inputs: ${inputs.map((input) => input.file_name).join(', ')}` : ''),
+        agent.model_name
+      ]
+    );
+    runId = runResult.insertId;
+
+    for (const input of inputs) {
+      await claim.execute(
+        'INSERT INTO run_inputs (agent_run_id, artifact_id) VALUES (?, ?)',
+        [runId, input.artifact_id]
+      );
+    }
+
+    await claim.commit();
+  } catch (error) {
+    await claim.rollback();
+    throw error;
+  } finally {
+    claim.release();
+  }
+
+  // 2. Run the agent outside any transaction (it may take seconds).
   const started = Date.now();
   let output;
-
   try {
     output = await runAgent({
       agent,
       task,
-      project: { name: task.project_name, description: task.project_description }
+      project: { name: task.project_name, description: task.project_description },
+      inputs
     });
   } catch (error) {
-    const latencyMs = Date.now() - started;
-    await pool.execute(
-      `UPDATE agent_runs
-       SET status = 'FAILED', finished_at = NOW(), latency_ms = ?, error_message = ?
-       WHERE agent_run_id = ?`,
-      [latencyMs, String(error.message).slice(0, 2000), runId]
-    );
-    await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
-    await pool.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['BLOCKED', taskId]);
+    await finishFailedRun(runId, agent.agent_id, taskId, Date.now() - started, error.message);
     throw new AppError(502, `Agent execution failed: ${error.message}`, 'AGENT_FAILED', { runId });
   }
 
+  // 3. Store the result. Everything is written in one transaction; if any write fails
+  //    the run is closed as FAILED so nothing is left half-finished.
   const latencyMs = Date.now() - started;
   const nextStatus = agent.role === 'REVIEWER' ? 'DONE' : 'REVIEW';
   const connection = await pool.getConnection();
@@ -235,11 +352,11 @@ async function runTask(taskId, requestedAgentId = null) {
   try {
     await connection.beginTransaction();
 
-    await connection.execute(
+    const [runUpdate] = await connection.execute(
       `UPDATE agent_runs
        SET status = 'SUCCESS', finished_at = NOW(), latency_ms = ?,
            output_summary = ?, raw_output = ?
-       WHERE agent_run_id = ?`,
+       WHERE agent_run_id = ? AND status = 'RUNNING'`,
       [
         latencyMs,
         output.summary,
@@ -252,21 +369,23 @@ async function runTask(taskId, requestedAgentId = null) {
         runId
       ]
     );
+    if (runUpdate.affectedRows !== 1) {
+      throw new AppError(409, 'The task was removed while the agent was running.', 'RUN_GONE');
+    }
 
     const [artifactResult] = await connection.execute(
       `INSERT INTO artifacts
-         (task_id, agent_run_id, artifact_type, file_name, file_path, content)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        taskId,
-        runId,
-        output.artifactType,
-        output.fileName,
-        `outputs/${output.fileName}`,
-        output.content
-      ]
+         (agent_run_id, artifact_type, file_name, file_path, content)
+       VALUES (?, ?, ?, ?, ?)`,
+      [runId, output.artifactType, output.fileName, `outputs/${output.fileName}`, output.content]
     );
 
+    // A task has at most one PRIMARY agent: hand the role to the agent that just ran it.
+    await connection.execute(
+      `DELETE FROM task_assignments
+       WHERE task_id = ? AND assignment_role = 'PRIMARY' AND agent_id <> ?`,
+      [taskId, agent.agent_id]
+    );
     await connection.execute(
       `INSERT INTO task_assignments (task_id, agent_id, assignment_role)
        VALUES (?, ?, 'PRIMARY')
@@ -274,8 +393,14 @@ async function runTask(taskId, requestedAgentId = null) {
       [taskId, agent.agent_id]
     );
 
-    await connection.execute('UPDATE tasks SET status = ? WHERE task_id = ?', [nextStatus, taskId]);
-    await connection.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
+    await connection.execute(
+      `UPDATE tasks SET status = ? WHERE task_id = ? AND status = 'IN_PROGRESS'`,
+      [nextStatus, taskId]
+    );
+    await connection.execute(
+      `UPDATE agents SET status = 'AVAILABLE' WHERE agent_id = ?`,
+      [agent.agent_id]
+    );
 
     if (output.provider !== 'mock') {
       await connection.execute(
@@ -300,11 +425,17 @@ async function runTask(taskId, requestedAgentId = null) {
         fileName: output.fileName,
         filePath: `outputs/${output.fileName}`
       },
+      inputs: inputs.map((input) => ({
+        artifactId: input.artifact_id,
+        fileName: input.file_name,
+        taskId: input.task_id,
+        taskTitle: input.task_title
+      })),
       task: { ...task, status: nextStatus }
     };
   } catch (error) {
     await connection.rollback();
-    await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
+    await finishFailedRun(runId, agent.agent_id, taskId, latencyMs, `Could not save run result: ${error.message}`);
     throw error;
   } finally {
     connection.release();
@@ -340,33 +471,55 @@ async function runNextTask(projectId) {
 }
 
 async function approveTask(taskId, reviewerId) {
-  const task = await getTaskContext(taskId);
-  if (task.status !== 'REVIEW') {
-    throw new AppError(409, 'Only tasks in REVIEW status can be approved.', 'TASK_NOT_IN_REVIEW');
-  }
-
-  const [artifacts] = await pool.execute(
-    'SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC, artifact_id DESC LIMIT 1',
-    [taskId]
-  );
-
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
 
-    let reviewId = null;
-    if (artifacts.length) {
-      const [reviewResult] = await connection.execute(
-        `INSERT INTO reviews (artifact_id, reviewer_id, status, comment, reviewed_at)
-         VALUES (?, ?, 'ACCEPTED', ?, NOW())`,
-        [artifacts[0].artifact_id, reviewerId, 'Accepted after human review.']
-      );
-      reviewId = reviewResult.insertId;
+    // Lock the task row so two approvals of the same task cannot interleave.
+    const [taskRows] = await connection.execute(
+      'SELECT * FROM tasks WHERE task_id = ? FOR UPDATE',
+      [taskId]
+    );
+    if (!taskRows.length) throw new AppError(404, 'Task not found.', 'TASK_NOT_FOUND');
+    const task = taskRows[0];
+    if (task.status !== 'REVIEW') {
+      throw new AppError(409, 'Only tasks in REVIEW status can be approved.', 'TASK_NOT_IN_REVIEW');
     }
 
-    await connection.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['DONE', taskId]);
+    // The artifact under review: newest artifact of the latest successful run that
+    // has not been reviewed yet. Without one there is nothing to approve.
+    const [artifacts] = await connection.execute(
+      `SELECT ar.artifact_id, ar.file_name
+       FROM agent_runs r
+       JOIN artifacts ar ON ar.agent_run_id = r.agent_run_id
+       WHERE r.task_id = ?
+         AND r.status = 'SUCCESS'
+         AND NOT EXISTS (SELECT 1 FROM reviews rv WHERE rv.artifact_id = ar.artifact_id)
+       ORDER BY r.agent_run_id DESC, ar.artifact_id DESC
+       LIMIT 1`,
+      [taskId]
+    );
+    if (!artifacts.length) {
+      throw new AppError(
+        409,
+        'There is no unreviewed artifact for this task. Run an agent before approving.',
+        'NO_ARTIFACT_TO_REVIEW'
+      );
+    }
+
+    const [reviewResult] = await connection.execute(
+      `INSERT INTO reviews (artifact_id, reviewer_id, status, comment, reviewed_at)
+       VALUES (?, ?, 'ACCEPTED', ?, NOW())`,
+      [artifacts[0].artifact_id, reviewerId, 'Accepted after human review.']
+    );
+
+    await connection.execute(`UPDATE tasks SET status = 'DONE' WHERE task_id = ?`, [taskId]);
     await connection.commit();
-    return { task: { ...task, status: 'DONE' }, reviewId };
+    return {
+      task: { ...task, status: 'DONE' },
+      reviewId: reviewResult.insertId,
+      artifact: { artifactId: artifacts[0].artifact_id, fileName: artifacts[0].file_name }
+    };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -422,6 +575,7 @@ module.exports = {
   approveTask,
   findDuplicateTask,
   findNextEligibleTask,
+  getApprovedInputs,
   getBlockingDependencies,
   getProjectDashboard,
   getTaskContext,

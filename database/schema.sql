@@ -2,6 +2,7 @@ SET FOREIGN_KEY_CHECKS = 0;
 
 -- ai_recommendations was removed from the design; drop it if an older schema created it.
 DROP TABLE IF EXISTS ai_recommendations;
+DROP TABLE IF EXISTS run_inputs;
 DROP TABLE IF EXISTS reviews;
 DROP TABLE IF EXISTS artifacts;
 DROP TABLE IF EXISTS agent_runs;
@@ -92,6 +93,8 @@ CREATE TABLE task_assignments (
   assignment_role ENUM('PRIMARY', 'SUPPORT', 'REVIEWER') NOT NULL DEFAULT 'PRIMARY',
   assigned_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (task_id, agent_id, assignment_role),
+  -- At most one PRIMARY agent per task (NULLs are ignored by a unique index).
+  UNIQUE KEY uk_one_primary_per_task ((CASE WHEN assignment_role = 'PRIMARY' THEN task_id END)),
   CONSTRAINT fk_task_assignment_task
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
     ON DELETE CASCADE,
@@ -126,22 +129,18 @@ CREATE TABLE agent_runs (
 ) ENGINE=InnoDB;
 
 -- Entity: artifacts (produces: agent_runs 1 -- N artifacts)
+-- The owning task is derived through agent_runs.task_id, so it is not stored here.
 CREATE TABLE artifacts (
   artifact_id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  task_id BIGINT UNSIGNED NOT NULL,
   agent_run_id BIGINT UNSIGNED NOT NULL,
   artifact_type ENUM('CODE', 'DOCUMENT', 'TEST_REPORT', 'LOG', 'OTHER') NOT NULL,
   file_name VARCHAR(255) NOT NULL,
   file_path VARCHAR(500) NULL,
   content LONGTEXT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT fk_artifacts_task
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
-    ON DELETE CASCADE,
   CONSTRAINT fk_artifacts_run
     FOREIGN KEY (agent_run_id) REFERENCES agent_runs(agent_run_id)
-    ON DELETE CASCADE,
-  INDEX idx_artifacts_task (task_id)
+    ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- Entity: reviews (receives: artifacts 1 -- N reviews; writes: users 1 -- N reviews)
@@ -160,4 +159,19 @@ CREATE TABLE reviews (
     FOREIGN KEY (reviewer_id) REFERENCES users(user_id)
     ON DELETE RESTRICT,
   INDEX idx_reviews_artifact (artifact_id)
+) ENGINE=InnoDB;
+
+-- Relationship: uses (M:N between agent_runs and artifacts)
+-- Records which approved upstream artifacts were given to a run as input.
+CREATE TABLE run_inputs (
+  agent_run_id BIGINT UNSIGNED NOT NULL,
+  artifact_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (agent_run_id, artifact_id),
+  CONSTRAINT fk_run_inputs_run
+    FOREIGN KEY (agent_run_id) REFERENCES agent_runs(agent_run_id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_run_inputs_artifact
+    FOREIGN KEY (artifact_id) REFERENCES artifacts(artifact_id)
+    ON DELETE CASCADE,
+  INDEX idx_run_inputs_artifact (artifact_id)
 ) ENGINE=InnoDB;

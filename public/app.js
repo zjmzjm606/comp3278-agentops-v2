@@ -10,6 +10,13 @@ const state = {
   artifacts: []
 };
 
+// Mirrors MANUAL_STATUS_TRANSITIONS in server.js: the statuses a user may pick directly.
+const MANUAL_STATUS_TRANSITIONS = {
+  TODO: ['BLOCKED', 'CANCELLED'],
+  BLOCKED: ['TODO', 'CANCELLED'],
+  CANCELLED: ['TODO']
+};
+
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
@@ -259,8 +266,52 @@ function bindStaticEvents() {
     button.addEventListener('click', () => switchView(button.dataset.view));
   });
 
+  $('#task-edit-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const taskId = Number(form.get('task_id'));
+    try {
+      const data = await api(`/api/tasks/${taskId}`, {
+        method: 'PATCH',
+        body: {
+          title: form.get('title'),
+          description: form.get('description'),
+          required_role: form.get('required_role'),
+          priority: form.get('priority'),
+          estimated_hours: form.get('estimated_hours'),
+          status: form.get('status')
+        }
+      });
+      $('#task-edit-dialog').close();
+      await refreshProject();
+      showToast(`Task #${data.task.task_id} updated.`, 'success');
+    } catch (error) {
+      showToast(error.message, 'error');
+    }
+  });
+
   document.addEventListener('click', handleDelegatedClick);
   $('#close-artifact').addEventListener('click', () => $('#artifact-dialog').close());
+  $('#close-task-edit').addEventListener('click', () => $('#task-edit-dialog').close());
+}
+
+function openTaskEditor(task) {
+  const form = $('#task-edit-form');
+  form.elements.task_id.value = task.task_id;
+  form.elements.title.value = task.title;
+  form.elements.description.value = task.description || '';
+  form.elements.required_role.value = task.required_role;
+  form.elements.priority.value = task.priority;
+  form.elements.estimated_hours.value = task.estimated_hours == null ? '' : Number(task.estimated_hours);
+  const statuses = [task.status, ...(MANUAL_STATUS_TRANSITIONS[task.status] || [])];
+  const statusSelect = $('#task-edit-status');
+  statusSelect.innerHTML = statuses
+    .map((status) => `<option value="${status}">${escapeHtml(status.replaceAll('_', ' '))}</option>`)
+    .join('');
+  statusSelect.value = task.status;
+  statusSelect.disabled = statuses.length === 1;
+  $('#task-edit-heading').textContent = `Edit task #${task.task_id}`;
+  $('#task-edit-dialog').showModal();
 }
 
 async function enterApp() {
@@ -541,6 +592,7 @@ function renderTasks() {
           ${assignmentHtml}
         </div>
         <div class="task-actions">
+          <button class="btn btn-quiet btn-small" data-action="edit-task" data-task-id="${task.task_id}">Edit</button>
           <button class="btn btn-quiet btn-small" data-action="recommend-task" data-task-id="${task.task_id}">Recommend agent</button>
           <button class="btn btn-accent btn-small" data-action="run-task" data-task-id="${task.task_id}" ${canRun ? '' : 'disabled title="Resolve dependencies or finish the current run first"'}>Run agent</button>
           ${task.status === 'REVIEW' ? `<button class="btn btn-quiet btn-small" data-action="approve-task" data-task-id="${task.task_id}">Approve</button>` : ''}
@@ -593,13 +645,14 @@ function renderRuns() {
   }
   $('#runs-table').innerHTML = `
     <table>
-      <thead><tr><th>Run</th><th>Agent</th><th>Task</th><th>Status</th><th>Started</th><th>Latency</th></tr></thead>
+      <thead><tr><th>Run</th><th>Agent</th><th>Task</th><th>Inputs</th><th>Status</th><th>Started</th><th>Latency</th></tr></thead>
       <tbody>
         ${state.runs.map((run) => `
           <tr>
             <td>#${run.agent_run_id}</td>
             <td><strong>${escapeHtml(run.agent_name)}</strong><br><small>${escapeHtml(run.agent_role)}</small></td>
             <td>${escapeHtml(run.task_title)}</td>
+            <td>${Number(run.input_count) ? `<small>${escapeHtml(run.input_files)}</small>` : '<small>—</small>'}</td>
             <td>${badge(run.status)}</td>
             <td>${formatDate(run.started_at)}</td>
             <td>${formatLatency(run.latency_ms)}</td>
@@ -644,8 +697,17 @@ async function handleDelegatedClick(event) {
       button.disabled = true;
       button.textContent = 'Running...';
       const result = await api(`/api/tasks/${taskId}/run`, { method: 'POST', body: {} });
-      showToast(`${result.run.agent.name} produced ${result.artifact.fileName}.`, 'success');
+      const used = result.inputs.length
+        ? ` using ${result.inputs.map((input) => input.fileName).join(', ')}`
+        : '';
+      showToast(`${result.run.agent.name} produced ${result.artifact.fileName}${used}.`, 'success');
       await refreshProject();
+    }
+
+    if (button.dataset.action === 'edit-task') {
+      const task = state.tasks.find((item) => Number(item.task_id) === taskId);
+      if (task) openTaskEditor(task);
+      return;
     }
 
     if (button.dataset.action === 'recommend-task') {

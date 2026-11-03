@@ -41,12 +41,17 @@ VALUES
   (1, 1, 1, 'SUCCESS', '2026-11-03 09:00:00', '2026-11-03 09:00:02', 2000, 'Analyze project requirements', 'Produced a requirements checklist', JSON_OBJECT('summary', 'Produced a requirements checklist', 'confidence', 0.91), 'mock-planner-v1'),
   (2, 2, 2, 'SUCCESS', '2026-11-03 09:10:00', '2026-11-03 09:10:04', 4000, 'Design MySQL schema', 'Produced schema.sql', JSON_OBJECT('summary', 'Produced schema.sql', 'confidence', 0.88), 'mock-coder-v1');
 
-INSERT INTO artifacts (artifact_id, task_id, agent_run_id, artifact_type, file_name, file_path, content)
+INSERT INTO artifacts (artifact_id, agent_run_id, artifact_type, file_name, file_path, content)
 VALUES
-  (1, 1, 1, 'DOCUMENT', 'requirements.md', 'outputs/requirements.md', '# Requirements\n\n- Authentication\n- Task management\n- Agent run tracking\n- Human review'),
-  (2, 2, 2, 'CODE', 'schema.sql', 'outputs/schema.sql', 'CREATE TABLE tasks (...);');
+  (1, 1, 'DOCUMENT', 'requirements.md', 'outputs/requirements.md', '# Requirements\n\n- Authentication\n- Task management\n- Agent run tracking\n- Human review'),
+  (2, 2, 'CODE', 'schema.sql', 'outputs/schema.sql', 'CREATE TABLE tasks (...);');
 
 INSERT INTO reviews (review_id, artifact_id, reviewer_id, status, comment, reviewed_at)
 VALUES
-  (1, 1, 2, 'ACCEPTED', 'Requirements are clear and complete.', '2026-11-03 09:20:00'),
+  (1, 1, 2, 'ACCEPTED', 'Requirements are clear and complete.', '2026-11-03 09:05:00'),
   (2, 2, 2, 'ACCEPTED', 'Schema covers the required entities and relationships.', '2026-11-03 09:30:00');
+
+-- Run 2 (schema design) was given the approved requirements document as input.
+INSERT INTO run_inputs (agent_run_id, artifact_id)
+VALUES
+  (2, 1);
