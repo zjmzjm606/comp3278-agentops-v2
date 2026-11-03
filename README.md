@@ -1,6 +1,6 @@
 # AgentOps — Multi-AI Project Control
 
-A database-driven web app for coordinating multiple AI agents on software-project tasks. The platform records projects, task dependencies, agent runs, artifacts, human reviews and AI recommendations in MySQL.
+A database-driven web app for coordinating multiple AI agents on software-project tasks. The platform records projects, task dependencies, agent assignments, agent runs, artifacts and human reviews in MySQL.
 
 This project is designed for the COMP3278 final project: it is a real web app with a MySQL database, complete CRUD operations, an ER model, key SQL queries, seed data and a reproducible local demo.
 
@@ -10,8 +10,8 @@ This project is designed for the COMP3278 final project: it is a real web app wi
 - Create tasks with required specialist roles and task dependencies.
 - Register Mock or Live AI agents.
 - Recommend the best available agent for a task.
-- Detect likely duplicate tasks by text similarity.
-- Generate a risk score for a task.
+- Detect likely duplicate tasks by text similarity (computed on demand, not stored).
+- Generate a risk score for a task (computed on demand, not stored).
 - Run the next eligible task through an agent.
 - Store agent run status, latency, model name and raw output.
 - Store generated artifacts and show their contents.
@@ -37,7 +37,8 @@ This project is designed for the COMP3278 final project: it is a real web app wi
 │   ├── schema.sql          # Tables, keys and indexes
 │   └── seed.sql            # Demo users, project, tasks, agents and runs
 ├── docs/
-│   ├── ER_DIAGRAM.md       # Mermaid ER diagram
+│   ├── ER_DIAGRAM.md       # ER diagram (Chen notation) and relational schema
+│   ├── er_diagram_chen.svg # Chen-notation ER diagram image
 │   ├── KEY_QUERIES.sql     # Queries used in the presentation
 │   └── RELATIONSHIPS_AND_TESTING.md  # Full relationship matrix and test plan
 ├── public/
@@ -150,7 +151,7 @@ A second seeded account is `bob@example.com` with the same demo password.
 2. Open the seeded **AgentOps Demo Project**.
 3. Open **Tasks**.
 4. Create a task or run the next eligible task.
-5. Click **Recommend agent** to generate an assignee and risk recommendation.
+5. Click **Recommend agent** to compute an assignee and risk recommendation (shown in the Recommendations card; not stored).
 6. Click **Run agent** to execute the task through the selected specialist.
 7. Open **Run history** and inspect the agent run and generated artifact.
 8. Approve a task in `REVIEW` status to mark it `DONE`.
@@ -196,18 +197,19 @@ If a Live provider is selected without a key, the run fails clearly and the erro
 
 ## Main database tables
 
-| Table | Purpose |
-|---|---|
-| `users` | Human users and reviewers |
-| `projects` | Software project workspaces |
-| `tasks` | Project tasks and current state |
-| `task_dependencies` | Self-referencing task dependency graph |
-| `agents` | Planner, coder, tester and reviewer agents |
-| `task_assignments` | Agents assigned to tasks |
-| `agent_runs` | Execution history, latency, status and raw output |
-| `artifacts` | Files or Markdown output produced by agents |
-| `reviews` | Human review decisions |
-| `ai_recommendations` | Assignee, risk and duplicate-task recommendations |
+| Table | Kind | Primary key | Purpose |
+|---|---|---|---|
+| `users` | Entity | `user_id` | Human users and reviewers |
+| `projects` | Entity | `project_id` | Software project workspaces |
+| `tasks` | Entity | `task_id` | Project tasks and current state |
+| `agents` | Entity | `agent_id` | Planner, coder, tester and reviewer agents |
+| `agent_runs` | Entity | `agent_run_id` | Execution history, latency, status and raw output |
+| `artifacts` | Entity | `artifact_id` | Files or Markdown output produced by agents |
+| `reviews` | Entity | `review_id` | Human review decisions |
+| `task_dependencies` | Relationship (recursive M:N on tasks) | `(task_id, depends_on_task_id)` | Which tasks must finish before another can run |
+| `task_assignments` | Relationship (M:N tasks–agents) | `(task_id, agent_id, assignment_role)` | Agents assigned to tasks, with their role |
+
+Every entity's primary key is prefixed with its table name, so foreign keys share the name of the key they reference (for example `tasks.project_id → projects.project_id`).
 
 See `docs/ER_DIAGRAM.md` for the ER diagram, and `docs/RELATIONSHIPS_AND_TESTING.md` for the complete relationship matrix and end-to-end test procedure.
 
@@ -246,7 +248,6 @@ See `docs/ER_DIAGRAM.md` for the ER diagram, and `docs/RELATIONSHIPS_AND_TESTING
 
 - `GET /api/projects/:projectId/dashboard`
 - `GET /api/projects/:projectId/runs`
-- `GET /api/projects/:projectId/recommendations`
 - `GET /api/projects/:projectId/artifacts`
 
 Full request examples are not required to run the UI; the browser frontend uses these endpoints directly.

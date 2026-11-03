@@ -38,7 +38,7 @@ function asyncHandler(handler) {
 
 function publicUser(user) {
   return {
-    id: user.id,
+    user_id: user.user_id,
     username: user.username,
     email: user.email,
     role: user.role
@@ -81,8 +81,8 @@ async function getProjectForUser(projectId, userId) {
   const [rows] = await pool.execute(
     `SELECT p.*, u.username AS owner_name
      FROM projects p
-     JOIN users u ON u.id = p.owner_id
-     WHERE p.id = ?`,
+     JOIN users u ON u.user_id = p.owner_id
+     WHERE p.project_id = ?`,
     [projectId]
   );
   if (!rows.length) throw new AppError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
@@ -96,8 +96,8 @@ async function getTaskForUser(taskId, userId) {
   const [rows] = await pool.execute(
     `SELECT t.*, p.owner_id
      FROM tasks t
-     JOIN projects p ON p.id = t.project_id
-     WHERE t.id = ?`,
+     JOIN projects p ON p.project_id = t.project_id
+     WHERE t.task_id = ?`,
     [taskId]
   );
   if (!rows.length) throw new AppError(404, 'Task not found.', 'TASK_NOT_FOUND');
@@ -126,7 +126,7 @@ app.post(
       );
       req.session.userId = result.insertId;
       res.status(201).json({
-        user: { id: result.insertId, username, email, role: 'MEMBER' }
+        user: { user_id: result.insertId, username, email, role: 'MEMBER' }
       });
     } catch (error) {
       if (error.code === 'ER_DUP_ENTRY') {
@@ -151,7 +151,7 @@ app.post(
       throw new AppError(401, 'Invalid email/username or password.', 'INVALID_CREDENTIALS');
     }
 
-    req.session.userId = rows[0].id;
+    req.session.userId = rows[0].user_id;
     res.json({ user: publicUser(rows[0]) });
   })
 );
@@ -164,7 +164,7 @@ app.get(
   '/api/auth/me',
   requireAuth,
   asyncHandler(async (req, res) => {
-    const [rows] = await pool.execute('SELECT * FROM users WHERE id = ?', [req.session.userId]);
+    const [rows] = await pool.execute('SELECT * FROM users WHERE user_id = ?', [req.session.userId]);
     if (!rows.length) {
       req.session.destroy(() => {});
       throw new AppError(401, 'Session user no longer exists.', 'AUTH_REQUIRED');
@@ -181,14 +181,14 @@ app.get(
     const [rows] = await pool.execute(
       `SELECT
          p.*,
-         COUNT(t.id) AS task_count,
+         COUNT(t.task_id) AS task_count,
          SUM(t.status = 'DONE') AS done_count,
          SUM(t.status = 'REVIEW') AS review_count
        FROM projects p
-       LEFT JOIN tasks t ON t.project_id = p.id
+       LEFT JOIN tasks t ON t.project_id = p.project_id
        WHERE p.owner_id = ?
-       GROUP BY p.id
-       ORDER BY p.created_at DESC, p.id DESC`,
+       GROUP BY p.project_id
+       ORDER BY p.created_at DESC, p.project_id DESC`,
       [req.session.userId]
     );
     res.json({ projects: rows });
@@ -205,7 +205,7 @@ app.post(
        VALUES (?, ?, ?, 'ACTIVE')`,
       [req.session.userId, name, description || null]
     );
-    const [rows] = await pool.execute('SELECT * FROM projects WHERE id = ?', [result.insertId]);
+    const [rows] = await pool.execute('SELECT * FROM projects WHERE project_id = ?', [result.insertId]);
     res.status(201).json({ project: rows[0] });
   })
 );
@@ -236,8 +236,8 @@ app.patch(
     if (!updates.length) throw new AppError(400, 'No supported fields supplied.', 'VALIDATION_ERROR');
 
     values.push(projectId);
-    await pool.execute(`UPDATE projects SET ${updates.join(', ')} WHERE id = ?`, values);
-    const [rows] = await pool.execute('SELECT * FROM projects WHERE id = ?', [projectId]);
+    await pool.execute(`UPDATE projects SET ${updates.join(', ')} WHERE project_id = ?`, values);
+    const [rows] = await pool.execute('SELECT * FROM projects WHERE project_id = ?', [projectId]);
     res.json({ project: rows[0] });
   })
 );
@@ -247,7 +247,7 @@ app.delete(
   asyncHandler(async (req, res) => {
     const projectId = idFrom(req.params.projectId, 'projectId');
     await getProjectForUser(projectId, req.session.userId);
-    await pool.execute('DELETE FROM projects WHERE id = ?', [projectId]);
+    await pool.execute('DELETE FROM projects WHERE project_id = ?', [projectId]);
     res.json({ ok: true });
   })
 );
@@ -261,29 +261,29 @@ app.get(
     const [tasks] = await pool.execute(
       `SELECT t.*, u.username AS creator_name
        FROM tasks t
-       JOIN users u ON u.id = t.created_by
+       JOIN users u ON u.user_id = t.created_by
        WHERE t.project_id = ?
-       ORDER BY FIELD(t.priority, 'URGENT', 'HIGH', 'MEDIUM', 'LOW'), t.created_at, t.id`,
+       ORDER BY FIELD(t.priority, 'URGENT', 'HIGH', 'MEDIUM', 'LOW'), t.created_at, t.task_id`,
       [projectId]
     );
 
     const [dependencies] = await pool.execute(
-      `SELECT td.task_id, dep.id, dep.title, dep.status
+      `SELECT td.task_id, td.depends_on_task_id, dep.title, dep.status
        FROM task_dependencies td
-       JOIN tasks t ON t.id = td.task_id
-       JOIN tasks dep ON dep.id = td.depends_on_task_id
+       JOIN tasks t ON t.task_id = td.task_id
+       JOIN tasks dep ON dep.task_id = td.depends_on_task_id
        WHERE t.project_id = ?
-       ORDER BY td.task_id, dep.id`,
+       ORDER BY td.task_id, td.depends_on_task_id`,
       [projectId]
     );
 
     const [assignments] = await pool.execute(
-      `SELECT ta.task_id, ta.assignment_role, a.id, a.name, a.role, a.status
+      `SELECT ta.task_id, ta.agent_id, ta.assignment_role, a.name, a.role, a.status
        FROM task_assignments ta
-       JOIN tasks t ON t.id = ta.task_id
-       JOIN agents a ON a.id = ta.agent_id
+       JOIN tasks t ON t.task_id = ta.task_id
+       JOIN agents a ON a.agent_id = ta.agent_id
        WHERE t.project_id = ?
-       ORDER BY ta.assignment_role, a.id`,
+       ORDER BY ta.assignment_role, ta.agent_id`,
       [projectId]
     );
 
@@ -301,8 +301,8 @@ app.get(
     res.json({
       tasks: tasks.map((task) => ({
         ...task,
-        dependencies: depsByTask.get(task.id) || [],
-        assignments: assignmentsByTask.get(task.id) || []
+        dependencies: depsByTask.get(task.task_id) || [],
+        assignments: assignmentsByTask.get(task.task_id) || []
       }))
     });
   })
@@ -346,7 +346,7 @@ app.post(
       if (dependencyIds.length) {
         const placeholders = dependencyIds.map(() => '?').join(', ');
         const [validDeps] = await connection.query(
-          `SELECT id FROM tasks WHERE project_id = ? AND id IN (${placeholders})`,
+          `SELECT task_id FROM tasks WHERE project_id = ? AND task_id IN (${placeholders})`,
           [projectId, ...dependencyIds]
         );
         if (validDeps.length !== dependencyIds.length) {
@@ -371,7 +371,7 @@ app.post(
     }
 
     const duplicate = await findDuplicateTask(taskId, projectId);
-    const [rows] = await pool.execute('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    const [rows] = await pool.execute('SELECT * FROM tasks WHERE task_id = ?', [taskId]);
     res.status(201).json({ task: rows[0], duplicate });
   })
 );
@@ -420,8 +420,8 @@ app.patch(
     if (!updates.length) throw new AppError(400, 'No supported fields supplied.', 'VALIDATION_ERROR');
 
     values.push(taskId);
-    await pool.execute(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, values);
-    const [rows] = await pool.execute('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    await pool.execute(`UPDATE tasks SET ${updates.join(', ')} WHERE task_id = ?`, values);
+    const [rows] = await pool.execute('SELECT * FROM tasks WHERE task_id = ?', [taskId]);
     res.json({ task: rows[0] });
   })
 );
@@ -431,7 +431,7 @@ app.delete(
   asyncHandler(async (req, res) => {
     const taskId = idFrom(req.params.taskId, 'taskId');
     await getTaskForUser(taskId, req.session.userId);
-    await pool.execute('DELETE FROM tasks WHERE id = ?', [taskId]);
+    await pool.execute('DELETE FROM tasks WHERE task_id = ?', [taskId]);
     res.json({ ok: true });
   })
 );
@@ -441,12 +441,12 @@ app.post(
   asyncHandler(async (req, res) => {
     const taskId = idFrom(req.params.taskId, 'taskId');
     await getTaskForUser(taskId, req.session.userId);
-    const result = await recommendAssignee(taskId, { persist: true });
+    const result = await recommendAssignee(taskId);
     res.json({
-      recommendationId: result.recommendationId,
       task: result.task,
       best: result.best,
-      candidates: result.candidates
+      candidates: result.candidates,
+      risk: result.risk
     });
   })
 );
@@ -503,41 +503,19 @@ app.get(
          t.title AS task_title,
          a.name AS agent_name,
          a.role AS agent_role,
-         ar.id AS artifact_id,
+         ar.artifact_id,
          ar.file_name,
          ar.artifact_type
        FROM agent_runs r
-       JOIN tasks t ON t.id = r.task_id
-       JOIN agents a ON a.id = r.agent_id
-       LEFT JOIN artifacts ar ON ar.agent_run_id = r.id
+       JOIN tasks t ON t.task_id = r.task_id
+       JOIN agents a ON a.agent_id = r.agent_id
+       LEFT JOIN artifacts ar ON ar.agent_run_id = r.agent_run_id
        WHERE t.project_id = ?
-       ORDER BY r.created_at DESC, r.id DESC
+       ORDER BY r.created_at DESC, r.agent_run_id DESC
        LIMIT 100`,
       [projectId]
     );
     res.json({ runs: rows });
-  })
-);
-
-app.get(
-  '/api/projects/:projectId/recommendations',
-  asyncHandler(async (req, res) => {
-    const projectId = idFrom(req.params.projectId, 'projectId');
-    await getProjectForUser(projectId, req.session.userId);
-    const [rows] = await pool.execute(
-      `SELECT
-         rec.*,
-         t.title AS task_title,
-         a.name AS recommended_agent_name
-       FROM ai_recommendations rec
-       JOIN tasks t ON t.id = rec.task_id
-       LEFT JOIN agents a ON a.id = rec.recommended_agent_id
-       WHERE t.project_id = ?
-       ORDER BY rec.created_at DESC, rec.id DESC
-       LIMIT 100`,
-      [projectId]
-    );
-    res.json({ recommendations: rows });
   })
 );
 
@@ -552,16 +530,16 @@ app.get(
          t.title AS task_title,
          r.agent_id,
          a.name AS agent_name,
-         rev.id AS review_id,
+         rev.review_id,
          rev.status AS review_status,
          rev.comment AS review_comment
        FROM artifacts ar
-       JOIN tasks t ON t.id = ar.task_id
-       JOIN agent_runs r ON r.id = ar.agent_run_id
-       JOIN agents a ON a.id = r.agent_id
-       LEFT JOIN reviews rev ON rev.artifact_id = ar.id
+       JOIN tasks t ON t.task_id = ar.task_id
+       JOIN agent_runs r ON r.agent_run_id = ar.agent_run_id
+       JOIN agents a ON a.agent_id = r.agent_id
+       LEFT JOIN reviews rev ON rev.artifact_id = ar.artifact_id
        WHERE t.project_id = ?
-       ORDER BY ar.created_at DESC, ar.id DESC
+       ORDER BY ar.created_at DESC, ar.artifact_id DESC
        LIMIT 100`,
       [projectId]
     );
@@ -575,14 +553,14 @@ app.get(
     const [rows] = await pool.execute(
       `SELECT
          a.*,
-         COUNT(r.id) AS total_runs,
+         COUNT(r.agent_run_id) AS total_runs,
          SUM(r.status = 'SUCCESS') AS successful_runs,
          ROUND(AVG(r.latency_ms), 0) AS avg_latency_ms,
          MAX(r.created_at) AS last_run_at
        FROM agents a
-       LEFT JOIN agent_runs r ON r.agent_id = a.id
-       GROUP BY a.id
-       ORDER BY FIELD(a.role, 'PLANNER', 'CODER', 'TESTER', 'REVIEWER'), a.id`
+       LEFT JOIN agent_runs r ON r.agent_id = a.agent_id
+       GROUP BY a.agent_id
+       ORDER BY FIELD(a.role, 'PLANNER', 'CODER', 'TESTER', 'REVIEWER'), a.agent_id`
     );
     res.json({ agents: rows });
   })
@@ -606,7 +584,7 @@ app.post(
          VALUES (?, ?, ?, ?, ?, 'AVAILABLE')`,
         [name, role, provider, modelName, executionMode]
       );
-      const [rows] = await pool.execute('SELECT * FROM agents WHERE id = ?', [result.insertId]);
+      const [rows] = await pool.execute('SELECT * FROM agents WHERE agent_id = ?', [result.insertId]);
       res.status(201).json({ agent: rows[0] });
     } catch (error) {
       if (error.code === 'ER_DUP_ENTRY') {
@@ -653,8 +631,8 @@ app.patch(
     }
     if (!updates.length) throw new AppError(400, 'No supported fields supplied.', 'VALIDATION_ERROR');
     values.push(agentId);
-    await pool.execute(`UPDATE agents SET ${updates.join(', ')} WHERE id = ?`, values);
-    const [rows] = await pool.execute('SELECT * FROM agents WHERE id = ?', [agentId]);
+    await pool.execute(`UPDATE agents SET ${updates.join(', ')} WHERE agent_id = ?`, values);
+    const [rows] = await pool.execute('SELECT * FROM agents WHERE agent_id = ?', [agentId]);
     if (!rows.length) throw new AppError(404, 'Agent not found.', 'AGENT_NOT_FOUND');
     res.json({ agent: rows[0] });
   })
@@ -665,7 +643,7 @@ app.delete(
   asyncHandler(async (req, res) => {
     const agentId = idFrom(req.params.agentId, 'agentId');
     try {
-      await pool.execute('DELETE FROM agents WHERE id = ?', [agentId]);
+      await pool.execute('DELETE FROM agents WHERE agent_id = ?', [agentId]);
       res.json({ ok: true });
     } catch (error) {
       if (error.code === 'ER_ROW_IS_REFERENCED_2') {

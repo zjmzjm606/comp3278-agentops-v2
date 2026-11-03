@@ -50,8 +50,8 @@ async function getTaskContext(taskId, executor = pool) {
        p.description AS project_description,
        p.owner_id
      FROM tasks t
-     JOIN projects p ON p.id = t.project_id
-     WHERE t.id = ?`,
+     JOIN projects p ON p.project_id = t.project_id
+     WHERE t.task_id = ?`,
     [taskId]
   );
 
@@ -61,12 +61,12 @@ async function getTaskContext(taskId, executor = pool) {
 
 async function getBlockingDependencies(taskId, executor = pool) {
   const [rows] = await executor.execute(
-    `SELECT dep.id, dep.title, dep.status
+    `SELECT dep.task_id, dep.title, dep.status
      FROM task_dependencies td
-     JOIN tasks dep ON dep.id = td.depends_on_task_id
+     JOIN tasks dep ON dep.task_id = td.depends_on_task_id
      WHERE td.task_id = ?
        AND dep.status <> 'DONE'
-     ORDER BY dep.id`,
+     ORDER BY dep.task_id`,
     [taskId]
   );
   return rows;
@@ -74,13 +74,13 @@ async function getBlockingDependencies(taskId, executor = pool) {
 
 async function findDuplicateTask(taskId, projectId) {
   const [taskRows] = await pool.execute(
-    'SELECT id, title, description FROM tasks WHERE id = ?',
+    'SELECT task_id, title, description FROM tasks WHERE task_id = ?',
     [taskId]
   );
   if (!taskRows.length) return null;
 
   const [otherTasks] = await pool.execute(
-    'SELECT id, title, description FROM tasks WHERE project_id = ? AND id <> ?',
+    'SELECT task_id, title, description FROM tasks WHERE project_id = ? AND task_id <> ?',
     [projectId, taskId]
   );
 
@@ -94,14 +94,8 @@ async function findDuplicateTask(taskId, projectId) {
 
   if (best && best.score >= 0.42) {
     const percentage = Number((best.score * 100).toFixed(2));
-    const reason = `Possible duplicate of task #${best.id} "${best.title}" (${percentage}% similarity).`;
-    const [result] = await pool.execute(
-      `INSERT INTO ai_recommendations
-         (task_id, recommendation_type, recommended_agent_id, score, reason, accepted)
-       VALUES (?, 'DUPLICATE', NULL, ?, ?, NULL)`,
-      [taskId, percentage, reason]
-    );
-    return { id: result.insertId, taskId: best.id, title: best.title, score: percentage, reason };
+    const reason = `Possible duplicate of task #${best.task_id} "${best.title}" (${percentage}% similarity).`;
+    return { taskId: best.task_id, title: best.title, score: percentage, reason };
   }
 
   return null;
@@ -111,14 +105,14 @@ async function scoreAgents(task) {
   const [agents] = await pool.execute(
     `SELECT
        a.*,
-       COUNT(r.id) AS total_runs,
+       COUNT(r.agent_run_id) AS total_runs,
        SUM(CASE WHEN r.status = 'SUCCESS' THEN 1 ELSE 0 END) AS successful_runs,
        SUM(CASE WHEN r.status = 'RUNNING' THEN 1 ELSE 0 END) AS running_runs
      FROM agents a
-     LEFT JOIN agent_runs r ON r.agent_id = a.id
+     LEFT JOIN agent_runs r ON r.agent_id = a.agent_id
      WHERE a.role = ?
-     GROUP BY a.id
-     ORDER BY a.id`,
+     GROUP BY a.agent_id
+     ORDER BY a.agent_id`,
     [task.required_role]
   );
 
@@ -143,10 +137,12 @@ async function scoreAgents(task) {
         reason: reasons.join('; ')
       };
     })
-    .sort((a, b) => b.score - a.score || a.id - b.id);
+    .sort((a, b) => b.score - a.score || a.agent_id - b.agent_id);
 }
 
-async function recommendAssignee(taskId, { persist = true } = {}) {
+// Recommendations are computed on demand from the run history and returned to the
+// caller; they are not stored in the database.
+async function recommendAssignee(taskId) {
   const task = await getTaskContext(taskId);
   const candidates = await scoreAgents(task);
   if (!candidates.length) {
@@ -154,33 +150,14 @@ async function recommendAssignee(taskId, { persist = true } = {}) {
   }
 
   const best = candidates[0];
-  let recommendationId = null;
+  const blocking = await getBlockingDependencies(taskId);
+  const priorityWeight = { LOW: 0, MEDIUM: 10, HIGH: 20, URGENT: 30 }[task.priority] || 0;
+  const riskScore = Math.max(0, Math.min(100, 25 + blocking.length * 18 + priorityWeight));
+  const riskReason = blocking.length
+    ? `${blocking.length} unfinished dependenc${blocking.length === 1 ? 'y' : 'ies'} and ${task.priority.toLowerCase()} priority.`
+    : `All dependencies are clear; ${task.priority.toLowerCase()} priority.`;
 
-  if (persist) {
-    const [result] = await pool.execute(
-      `INSERT INTO ai_recommendations
-         (task_id, recommendation_type, recommended_agent_id, score, reason, accepted)
-       VALUES (?, 'ASSIGNEE', ?, ?, ?, NULL)`,
-      [taskId, best.id, best.score, best.reason]
-    );
-    recommendationId = result.insertId;
-
-    const blocking = await getBlockingDependencies(taskId);
-    const priorityWeight = { LOW: 0, MEDIUM: 10, HIGH: 20, URGENT: 30 }[task.priority] || 0;
-    const riskScore = Math.max(0, Math.min(100, 25 + blocking.length * 18 + priorityWeight));
-    const riskReason = blocking.length
-      ? `${blocking.length} unfinished dependenc${blocking.length === 1 ? 'y' : 'ies'} and ${task.priority.toLowerCase()} priority.`
-      : `All dependencies are clear; ${task.priority.toLowerCase()} priority.`;
-
-    await pool.execute(
-      `INSERT INTO ai_recommendations
-         (task_id, recommendation_type, recommended_agent_id, score, reason, accepted)
-       VALUES (?, 'RISK', NULL, ?, ?, NULL)`,
-      [taskId, riskScore, riskReason]
-    );
-  }
-
-  return { recommendationId, task, best, candidates };
+  return { task, best, candidates, risk: { score: riskScore, reason: riskReason } };
 }
 
 async function runTask(taskId, requestedAgentId = null) {
@@ -200,7 +177,7 @@ async function runTask(taskId, requestedAgentId = null) {
 
   let agent = null;
   if (requestedAgentId) {
-    const [rows] = await pool.execute('SELECT * FROM agents WHERE id = ?', [requestedAgentId]);
+    const [rows] = await pool.execute('SELECT * FROM agents WHERE agent_id = ?', [requestedAgentId]);
     agent = rows[0];
     if (!agent) throw new AppError(404, 'Agent not found.', 'AGENT_NOT_FOUND');
     if (agent.role !== task.required_role) {
@@ -214,7 +191,7 @@ async function runTask(taskId, requestedAgentId = null) {
       throw new AppError(409, `Agent is currently ${agent.status.toLowerCase()}.`, 'AGENT_UNAVAILABLE');
     }
   } else {
-    const recommendation = await recommendAssignee(taskId, { persist: true });
+    const recommendation = await recommendAssignee(taskId);
     agent = recommendation.best;
   }
 
@@ -222,12 +199,12 @@ async function runTask(taskId, requestedAgentId = null) {
     `INSERT INTO agent_runs
        (task_id, agent_id, status, started_at, input_summary, model_name)
      VALUES (?, ?, 'RUNNING', NOW(), ?, ?)`,
-    [taskId, agent.id, `${task.title}: ${task.description || 'No description'}`, agent.model_name]
+    [taskId, agent.agent_id, `${task.title}: ${task.description || 'No description'}`, agent.model_name]
   );
   const runId = runResult.insertId;
 
-  await pool.execute('UPDATE agents SET status = ? WHERE id = ?', ['BUSY', agent.id]);
-  await pool.execute('UPDATE tasks SET status = ? WHERE id = ?', ['IN_PROGRESS', taskId]);
+  await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['BUSY', agent.agent_id]);
+  await pool.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['IN_PROGRESS', taskId]);
 
   const started = Date.now();
   let output;
@@ -243,11 +220,11 @@ async function runTask(taskId, requestedAgentId = null) {
     await pool.execute(
       `UPDATE agent_runs
        SET status = 'FAILED', finished_at = NOW(), latency_ms = ?, error_message = ?
-       WHERE id = ?`,
+       WHERE agent_run_id = ?`,
       [latencyMs, String(error.message).slice(0, 2000), runId]
     );
-    await pool.execute('UPDATE agents SET status = ? WHERE id = ?', ['AVAILABLE', agent.id]);
-    await pool.execute('UPDATE tasks SET status = ? WHERE id = ?', ['BLOCKED', taskId]);
+    await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
+    await pool.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['BLOCKED', taskId]);
     throw new AppError(502, `Agent execution failed: ${error.message}`, 'AGENT_FAILED', { runId });
   }
 
@@ -262,7 +239,7 @@ async function runTask(taskId, requestedAgentId = null) {
       `UPDATE agent_runs
        SET status = 'SUCCESS', finished_at = NOW(), latency_ms = ?,
            output_summary = ?, raw_output = ?
-       WHERE id = ?`,
+       WHERE agent_run_id = ?`,
       [
         latencyMs,
         output.summary,
@@ -294,16 +271,16 @@ async function runTask(taskId, requestedAgentId = null) {
       `INSERT INTO task_assignments (task_id, agent_id, assignment_role)
        VALUES (?, ?, 'PRIMARY')
        ON DUPLICATE KEY UPDATE assigned_at = CURRENT_TIMESTAMP`,
-      [taskId, agent.id]
+      [taskId, agent.agent_id]
     );
 
-    await connection.execute('UPDATE tasks SET status = ? WHERE id = ?', [nextStatus, taskId]);
-    await connection.execute('UPDATE agents SET status = ? WHERE id = ?', ['AVAILABLE', agent.id]);
+    await connection.execute('UPDATE tasks SET status = ? WHERE task_id = ?', [nextStatus, taskId]);
+    await connection.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
 
     if (output.provider !== 'mock') {
       await connection.execute(
-        'UPDATE agents SET provider = ?, model_name = ? WHERE id = ?',
-        [output.provider, output.model, agent.id]
+        'UPDATE agents SET provider = ?, model_name = ? WHERE agent_id = ?',
+        [output.provider, output.model, agent.agent_id]
       );
     }
 
@@ -311,14 +288,14 @@ async function runTask(taskId, requestedAgentId = null) {
 
     return {
       run: {
-        id: runId,
+        agentRunId: runId,
         status: 'SUCCESS',
         latencyMs,
         agent,
         output
       },
       artifact: {
-        id: artifactResult.insertId,
+        artifactId: artifactResult.insertId,
         type: output.artifactType,
         fileName: output.fileName,
         filePath: `outputs/${output.fileName}`
@@ -327,7 +304,7 @@ async function runTask(taskId, requestedAgentId = null) {
     };
   } catch (error) {
     await connection.rollback();
-    await pool.execute('UPDATE agents SET status = ? WHERE id = ?', ['AVAILABLE', agent.id]);
+    await pool.execute('UPDATE agents SET status = ? WHERE agent_id = ?', ['AVAILABLE', agent.agent_id]);
     throw error;
   } finally {
     connection.release();
@@ -343,11 +320,11 @@ async function findNextEligibleTask(projectId) {
        AND NOT EXISTS (
          SELECT 1
          FROM task_dependencies td
-         JOIN tasks dep ON dep.id = td.depends_on_task_id
-         WHERE td.task_id = t.id
+         JOIN tasks dep ON dep.task_id = td.depends_on_task_id
+         WHERE td.task_id = t.task_id
            AND dep.status <> 'DONE'
        )
-     ORDER BY FIELD(t.priority, 'URGENT', 'HIGH', 'MEDIUM', 'LOW'), t.created_at, t.id
+     ORDER BY FIELD(t.priority, 'URGENT', 'HIGH', 'MEDIUM', 'LOW'), t.created_at, t.task_id
      LIMIT 1`,
     [projectId]
   );
@@ -359,7 +336,7 @@ async function runNextTask(projectId) {
   if (!task) {
     throw new AppError(404, 'No eligible task is currently ready to run.', 'NO_ELIGIBLE_TASK');
   }
-  return runTask(task.id);
+  return runTask(task.task_id);
 }
 
 async function approveTask(taskId, reviewerId) {
@@ -369,7 +346,7 @@ async function approveTask(taskId, reviewerId) {
   }
 
   const [artifacts] = await pool.execute(
-    'SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
+    'SELECT * FROM artifacts WHERE task_id = ? ORDER BY created_at DESC, artifact_id DESC LIMIT 1',
     [taskId]
   );
 
@@ -382,12 +359,12 @@ async function approveTask(taskId, reviewerId) {
       const [reviewResult] = await connection.execute(
         `INSERT INTO reviews (artifact_id, reviewer_id, status, comment, reviewed_at)
          VALUES (?, ?, 'ACCEPTED', ?, NOW())`,
-        [artifacts[0].id, reviewerId, 'Accepted after human review.']
+        [artifacts[0].artifact_id, reviewerId, 'Accepted after human review.']
       );
       reviewId = reviewResult.insertId;
     }
 
-    await connection.execute('UPDATE tasks SET status = ? WHERE id = ?', ['DONE', taskId]);
+    await connection.execute('UPDATE tasks SET status = ? WHERE task_id = ?', ['DONE', taskId]);
     await connection.commit();
     return { task: { ...task, status: 'DONE' }, reviewId };
   } catch (error) {
@@ -399,7 +376,7 @@ async function approveTask(taskId, reviewerId) {
 }
 
 async function getProjectDashboard(projectId) {
-  const [projectRows] = await pool.execute('SELECT * FROM projects WHERE id = ?', [projectId]);
+  const [projectRows] = await pool.execute('SELECT * FROM projects WHERE project_id = ?', [projectId]);
   if (!projectRows.length) throw new AppError(404, 'Project not found.', 'PROJECT_NOT_FOUND');
 
   const [[taskStats]] = await pool.execute(
@@ -418,21 +395,21 @@ async function getProjectDashboard(projectId) {
             SUM(r.status = 'SUCCESS') AS successful_runs,
             ROUND(AVG(r.latency_ms), 0) AS avg_latency_ms
      FROM agent_runs r
-     JOIN tasks t ON t.id = r.task_id
+     JOIN tasks t ON t.task_id = r.task_id
      WHERE t.project_id = ?`,
     [projectId]
   );
 
   const [recentRuns] = await pool.execute(
     `SELECT
-       r.id, r.status, r.started_at, r.finished_at, r.latency_ms,
-       t.id AS task_id, t.title AS task_title,
-       a.id AS agent_id, a.name AS agent_name, a.role AS agent_role
+       r.agent_run_id, r.status, r.started_at, r.finished_at, r.latency_ms,
+       t.task_id, t.title AS task_title,
+       a.agent_id, a.name AS agent_name, a.role AS agent_role
      FROM agent_runs r
-     JOIN tasks t ON t.id = r.task_id
-     JOIN agents a ON a.id = r.agent_id
+     JOIN tasks t ON t.task_id = r.task_id
+     JOIN agents a ON a.agent_id = r.agent_id
      WHERE t.project_id = ?
-     ORDER BY r.created_at DESC, r.id DESC
+     ORDER BY r.created_at DESC, r.agent_run_id DESC
      LIMIT 8`,
     [projectId]
   );

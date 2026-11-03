@@ -6,7 +6,7 @@ const state = {
   agents: [],
   dashboard: null,
   runs: [],
-  recommendations: [],
+  signals: [],
   artifacts: []
 };
 
@@ -105,7 +105,7 @@ function taskIsReady(task) {
 }
 
 function activeProject() {
-  return state.projects.find((project) => Number(project.id) === Number(state.projectId));
+  return state.projects.find((project) => Number(project.project_id) === Number(state.projectId));
 }
 
 async function init() {
@@ -195,7 +195,7 @@ function bindStaticEvents() {
       });
       $('#project-dialog').close();
       event.currentTarget.reset();
-      state.projectId = data.project.id;
+      state.projectId = data.project.project_id;
       await loadProjects();
       showToast('Project created.', 'success');
     } catch (error) {
@@ -222,6 +222,7 @@ function bindStaticEvents() {
       event.currentTarget.reset();
       await refreshProject();
       if (data.duplicate) {
+        addSignals([{ type: 'DUPLICATE', score: data.duplicate.score, title: data.task.title, reason: data.duplicate.reason }]);
         showToast(data.duplicate.reason, 'error');
       } else {
         showToast('Task created.', 'success');
@@ -275,7 +276,7 @@ async function loadProjects() {
   state.projects = data.projects;
   const select = $('#project-select');
   select.innerHTML = state.projects
-    .map((project) => `<option value="${project.id}">${escapeHtml(project.name)}</option>`)
+    .map((project) => `<option value="${project.project_id}">${escapeHtml(project.name)}</option>`)
     .join('');
 
   if (!state.projects.length) {
@@ -284,14 +285,14 @@ async function loadProjects() {
     state.agents = [];
     state.dashboard = null;
     state.runs = [];
-    state.recommendations = [];
+    state.signals = [];
     state.artifacts = [];
     renderAll();
     return;
   }
 
-  if (!state.projects.some((project) => Number(project.id) === Number(state.projectId))) {
-    state.projectId = state.projects[0].id;
+  if (!state.projects.some((project) => Number(project.project_id) === Number(state.projectId))) {
+    state.projectId = state.projects[0].project_id;
   }
   select.value = String(state.projectId);
   await loadProject(state.projectId);
@@ -302,20 +303,19 @@ async function loadProject(projectId) {
   const previousProject = state.projectId;
   state.projectId = Number(projectId);
   try {
-    const [tasks, agents, dashboard, runs, recommendations, artifacts] = await Promise.all([
+    const [tasks, agents, dashboard, runs, artifacts] = await Promise.all([
       api(`/api/projects/${projectId}/tasks`),
       api('/api/agents'),
       api(`/api/projects/${projectId}/dashboard`),
       api(`/api/projects/${projectId}/runs`),
-      api(`/api/projects/${projectId}/recommendations`),
       api(`/api/projects/${projectId}/artifacts`)
     ]);
     if (Number(state.projectId) !== Number(projectId)) return;
+    if (Number(previousProject) !== Number(projectId)) state.signals = [];
     state.tasks = tasks.tasks;
     state.agents = agents.agents;
     state.dashboard = dashboard;
     state.runs = runs.runs;
-    state.recommendations = recommendations.recommendations;
     state.artifacts = artifacts.artifacts;
     renderAll();
   } catch (error) {
@@ -358,19 +358,18 @@ function renderAll() {
   renderReadyTasks();
   renderFleet();
   renderRecentRuns();
-  renderRecommendationsSummary();
+  renderSignals();
   renderTasks();
   renderAgents();
   renderRuns();
   renderArtifacts();
-  renderRecommendationLog();
 }
 
 function renderDependencyOptions() {
   const select = $('#dependency-select');
   const selected = new Set([...select.selectedOptions].map((option) => option.value));
   select.innerHTML = state.tasks
-    .map((task) => `<option value="${task.id}">#${task.id} · ${escapeHtml(task.title)} [${escapeHtml(task.status)}]</option>`)
+    .map((task) => `<option value="${task.task_id}">#${task.task_id} · ${escapeHtml(task.title)} [${escapeHtml(task.status)}]</option>`)
     .join('');
   [...select.options].forEach((option) => {
     option.selected = selected.has(option.value);
@@ -424,10 +423,10 @@ function renderReadyTasks() {
     <div class="ready-item">
       <div>
         <h3>${escapeHtml(task.title)}</h3>
-        <p>#${task.id} · ${escapeHtml(task.required_role)} · ${escapeHtml(task.priority)} priority</p>
+        <p>#${task.task_id} · ${escapeHtml(task.required_role)} · ${escapeHtml(task.priority)} priority</p>
       </div>
       <div class="ready-item-actions">
-        <button class="btn btn-accent btn-small" data-action="run-task" data-task-id="${task.id}">Run agent</button>
+        <button class="btn btn-accent btn-small" data-action="run-task" data-task-id="${task.task_id}">Run agent</button>
       </div>
     </div>
   `).join('');
@@ -435,7 +434,7 @@ function renderReadyTasks() {
 
 function renderFleet() {
   const agents = [...state.agents].sort((a, b) => {
-    if (a.status === b.status) return a.id - b.id;
+    if (a.status === b.status) return a.agent_id - b.agent_id;
     return a.status === 'AVAILABLE' ? -1 : 1;
   });
   $('#fleet-list').innerHTML = agents.length
@@ -480,16 +479,23 @@ function renderRecentRuns() {
   `;
 }
 
-function renderRecommendationsSummary() {
-  const items = state.recommendations.slice(0, 4);
+// Recommendations are computed on demand and kept only in this browser session;
+// they are not stored in the database.
+function addSignals(items) {
+  state.signals = [...items, ...state.signals].slice(0, 8);
+  renderSignals();
+}
+
+function renderSignals() {
+  const items = state.signals.slice(0, 4);
   $('#recommendation-list').innerHTML = items.length
     ? items.map((item) => `
-        <div class="signal-item ${item.recommendation_type === 'RISK' ? 'risk' : item.recommendation_type === 'DUPLICATE' ? 'duplicate' : ''}">
-          <strong>${escapeHtml(item.recommendation_type)} · ${item.score == null ? '—' : Number(item.score).toFixed(1)}</strong>
-          <p>${escapeHtml(item.reason || 'No reason recorded.')}</p>
+        <div class="signal-item ${item.type === 'RISK' ? 'risk' : item.type === 'DUPLICATE' ? 'duplicate' : ''}">
+          <strong>${escapeHtml(item.type)} · ${item.score == null ? '—' : Number(item.score).toFixed(1)}</strong>
+          <p>${escapeHtml(item.title)}<br>${escapeHtml(item.reason || '')}</p>
         </div>
       `).join('')
-    : `<div class="empty-state">AI recommendations appear here.</div>`;
+    : `<div class="empty-state">Click "Recommend agent" on a task to compute a recommendation.</div>`;
 }
 
 function renderTasks() {
@@ -507,7 +513,7 @@ function renderTasks() {
     const dependencyHtml = dependencies.length
       ? dependencies.map((dependency) => `
           <span class="meta-chip ${dependency.status === 'DONE' ? 'dependency-done' : 'dependency-blocked'}">
-            ${dependency.status === 'DONE' ? '✓' : '⛔'} #${dependency.id} ${escapeHtml(dependency.title)}
+            ${dependency.status === 'DONE' ? '✓' : '⛔'} #${dependency.depends_on_task_id} ${escapeHtml(dependency.title)}
           </span>
         `).join('')
       : '<span class="meta-chip">No dependencies</span>';
@@ -526,7 +532,7 @@ function renderTasks() {
             </div>
             <p class="task-description">${escapeHtml(task.description || 'No description provided.')}</p>
           </div>
-          <span class="meta-chip">#${task.id}</span>
+          <span class="meta-chip">#${task.task_id}</span>
         </div>
         <div class="task-meta">
           <span class="meta-chip">Role: ${escapeHtml(task.required_role)}</span>
@@ -535,10 +541,10 @@ function renderTasks() {
           ${assignmentHtml}
         </div>
         <div class="task-actions">
-          <button class="btn btn-quiet btn-small" data-action="recommend-task" data-task-id="${task.id}">Recommend agent</button>
-          <button class="btn btn-accent btn-small" data-action="run-task" data-task-id="${task.id}" ${canRun ? '' : 'disabled title="Resolve dependencies or finish the current run first"'}>Run agent</button>
-          ${task.status === 'REVIEW' ? `<button class="btn btn-quiet btn-small" data-action="approve-task" data-task-id="${task.id}">Approve</button>` : ''}
-          <button class="btn btn-danger btn-small" data-action="delete-task" data-task-id="${task.id}">Delete</button>
+          <button class="btn btn-quiet btn-small" data-action="recommend-task" data-task-id="${task.task_id}">Recommend agent</button>
+          <button class="btn btn-accent btn-small" data-action="run-task" data-task-id="${task.task_id}" ${canRun ? '' : 'disabled title="Resolve dependencies or finish the current run first"'}>Run agent</button>
+          ${task.status === 'REVIEW' ? `<button class="btn btn-quiet btn-small" data-action="approve-task" data-task-id="${task.task_id}">Approve</button>` : ''}
+          <button class="btn btn-danger btn-small" data-action="delete-task" data-task-id="${task.task_id}">Delete</button>
         </div>
       </article>
     `;
@@ -572,8 +578,8 @@ function renderAgents() {
         </div>
         <div class="agent-footer">
           <small>${escapeHtml(agent.model_name || 'No model')} · last run ${formatDate(agent.last_run_at)}</small>
-          ${canPause ? `<button class="btn btn-quiet btn-small" data-action="pause-agent" data-agent-id="${agent.id}">Pause</button>` : ''}
-          ${canActivate ? `<button class="btn btn-quiet btn-small" data-action="activate-agent" data-agent-id="${agent.id}">Activate</button>` : ''}
+          ${canPause ? `<button class="btn btn-quiet btn-small" data-action="pause-agent" data-agent-id="${agent.agent_id}">Pause</button>` : ''}
+          ${canActivate ? `<button class="btn btn-quiet btn-small" data-action="activate-agent" data-agent-id="${agent.agent_id}">Activate</button>` : ''}
         </div>
       </article>
     `;
@@ -591,7 +597,7 @@ function renderRuns() {
       <tbody>
         ${state.runs.map((run) => `
           <tr>
-            <td>#${run.id}</td>
+            <td>#${run.agent_run_id}</td>
             <td><strong>${escapeHtml(run.agent_name)}</strong><br><small>${escapeHtml(run.agent_role)}</small></td>
             <td>${escapeHtml(run.task_title)}</td>
             <td>${badge(run.status)}</td>
@@ -615,20 +621,7 @@ function renderArtifacts() {
         <h4>${escapeHtml(artifact.file_name)}</h4>
         <p>${escapeHtml(artifact.artifact_type)} · ${escapeHtml(artifact.agent_name)} · ${escapeHtml(artifact.task_title)}</p>
       </div>
-      <button class="btn btn-quiet btn-small" data-action="view-artifact" data-artifact-id="${artifact.id}">Open</button>
-    </div>
-  `).join('');
-}
-
-function renderRecommendationLog() {
-  if (!state.recommendations.length) {
-    $('#recommendation-log').innerHTML = `<div class="empty-state">No recommendations yet.</div>`;
-    return;
-  }
-  $('#recommendation-log').innerHTML = state.recommendations.slice(0, 10).map((item) => `
-    <div class="signal-item ${item.recommendation_type === 'RISK' ? 'risk' : item.recommendation_type === 'DUPLICATE' ? 'duplicate' : ''}">
-      <strong>${escapeHtml(item.recommendation_type)} · ${item.score == null ? '—' : Number(item.score).toFixed(1)}</strong>
-      <p>${escapeHtml(item.task_title)}<br>${escapeHtml(item.reason || 'No reason recorded.')}</p>
+      <button class="btn btn-quiet btn-small" data-action="view-artifact" data-artifact-id="${artifact.artifact_id}">Open</button>
     </div>
   `).join('');
 }
@@ -659,8 +652,12 @@ async function handleDelegatedClick(event) {
       button.disabled = true;
       button.textContent = 'Scoring...';
       const result = await api(`/api/tasks/${taskId}/recommend`, { method: 'POST', body: {} });
+      addSignals([
+        { type: 'ASSIGNEE', score: result.best.score, title: result.task.title, reason: `${result.best.name}: ${result.best.reason}` },
+        { type: 'RISK', score: result.risk.score, title: result.task.title, reason: result.risk.reason }
+      ]);
       showToast(`Recommended ${result.best.name}: ${result.best.score.toFixed(1)} / 100.`, 'success');
-      await refreshProject();
+      renderTasks();
     }
 
     if (button.dataset.action === 'approve-task') {
@@ -689,7 +686,7 @@ async function handleDelegatedClick(event) {
     }
 
     if (button.dataset.action === 'view-artifact') {
-      const artifact = state.artifacts.find((item) => Number(item.id) === artifactId);
+      const artifact = state.artifacts.find((item) => Number(item.artifact_id) === artifactId);
       if (artifact) {
         $('#artifact-title').textContent = artifact.file_name;
         $('#artifact-content').textContent = artifact.content || 'No content stored for this artifact.';
