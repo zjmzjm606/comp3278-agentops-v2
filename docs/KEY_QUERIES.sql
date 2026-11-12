@@ -47,7 +47,7 @@ LEFT JOIN agent_runs r
 GROUP BY a.agent_id, a.name, a.role
 ORDER BY a.agent_id;
 
--- 4. Full execution trace for one task
+-- 4. Full execution trace for one task (task 2 has a run, an artifact and a review in the seed data)
 SELECT
   t.task_id,
   t.title AS task_title,
@@ -69,7 +69,7 @@ LEFT JOIN artifacts art
   ON art.agent_run_id = arun.agent_run_id
 LEFT JOIN reviews rev
   ON rev.artifact_id = art.artifact_id
-WHERE t.task_id = 3
+WHERE t.task_id = 2
 ORDER BY arun.created_at, art.artifact_id;
 
 -- 5. What the next agent receives: for each prerequisite of task 3, the latest

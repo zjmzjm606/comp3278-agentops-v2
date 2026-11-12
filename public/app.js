@@ -192,16 +192,18 @@ function bindStaticEvents() {
     await loadProject(state.projectId);
   });
 
+  // event.currentTarget is null once the handler has awaited, so keep the form element.
   $('#project-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
     try {
       const data = await api('/api/projects', {
         method: 'POST',
         body: { name: form.get('name'), description: form.get('description') }
       });
       $('#project-dialog').close();
-      event.currentTarget.reset();
+      formEl.reset();
       state.projectId = data.project.project_id;
       await loadProjects();
       showToast('Project created.', 'success');
@@ -212,7 +214,8 @@ function bindStaticEvents() {
 
   $('#task-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
     const dependencySelect = $('#dependency-select');
     try {
       const data = await api(`/api/projects/${state.projectId}/tasks`, {
@@ -226,7 +229,7 @@ function bindStaticEvents() {
           depends_on_ids: [...dependencySelect.selectedOptions].map((option) => Number(option.value))
         }
       });
-      event.currentTarget.reset();
+      formEl.reset();
       await refreshProject();
       if (data.duplicate) {
         addSignals([{ type: 'DUPLICATE', score: data.duplicate.score, title: data.task.title, reason: data.duplicate.reason }]);
@@ -241,7 +244,8 @@ function bindStaticEvents() {
 
   $('#agent-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formEl = event.currentTarget;
+    const form = new FormData(formEl);
     try {
       await api('/api/agents', {
         method: 'POST',
@@ -253,8 +257,8 @@ function bindStaticEvents() {
           model_name: form.get('model_name')
         }
       });
-      event.currentTarget.reset();
-      $('input[name="model_name"]', event.currentTarget).value = 'mock-agent-v1';
+      formEl.reset();
+      $('input[name="model_name"]', formEl).value = 'mock-agent-v1';
       await refreshProject();
       showToast('Agent registered.', 'success');
     } catch (error) {

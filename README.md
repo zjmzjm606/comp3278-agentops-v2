@@ -2,7 +2,23 @@
 
 A database-driven web app for coordinating multiple AI agents on software-project tasks. The platform records projects, task dependencies, agent assignments, agent runs, artifacts and human reviews in MySQL.
 
-This project is designed for the COMP3278 final project: it is a real web app with a MySQL database, complete CRUD operations, an ER model, key SQL queries, seed data and a reproducible local demo.
+This project is designed for the COMP3278 final project (Group 16): it is a real web app with a MySQL database, complete CRUD operations, an ER model, key SQL queries, seed data and a reproducible local demo.
+
+## Quick start
+
+With Node.js 20+ and MySQL 8+ installed and MySQL running:
+
+```bash
+npm install
+cp .env.example .env          # Windows (cmd): copy .env.example .env
+# edit .env: set DB_USER and DB_PASSWORD to your MySQL account
+npm run db:setup              # creates database `agentops`, tables and demo data
+npm start                     # then open http://localhost:3000
+```
+
+Sign in with `alice@example.com` / `password123`. No API key is needed: agents run in deterministic Mock mode by default.
+
+Each step is explained below, including a manual alternative for the database setup and a query to check that the data loaded.
 
 ## What the app does
 
@@ -38,7 +54,8 @@ This project is designed for the COMP3278 final project: it is a real web app wi
 │   └── seed.sql            # Demo users, project, tasks, agents and runs
 ├── docs/
 │   ├── ER_DIAGRAM.md       # ER diagram (Chen notation) and relational schema
-│   ├── er_diagram_chen.svg # Chen-notation ER diagram image
+│   ├── er_diagram_chen.svg # Chen-notation ER diagram (vector)
+│   ├── er_diagram_chen.png # Chen-notation ER diagram (image)
 │   ├── KEY_QUERIES.sql     # Queries used in the presentation
 │   └── RELATIONSHIPS_AND_TESTING.md  # Full relationship matrix and test plan
 ├── public/
@@ -87,7 +104,9 @@ Copy the example environment file:
 cp .env.example .env
 ```
 
-Edit `.env` for your local MySQL account:
+On Windows (Command Prompt) use `copy .env.example .env`; in PowerShell use `Copy-Item .env.example .env`.
+
+Edit `.env` for your local MySQL account. Only `DB_USER` and `DB_PASSWORD` normally need changing:
 
 ```env
 PORT=3000
@@ -104,10 +123,12 @@ Do not commit `.env`.
 
 ## Database setup
 
-Start MySQL first. On macOS with Homebrew:
+Start MySQL first:
 
 ```bash
-brew services start mysql
+brew services start mysql          # macOS (Homebrew)
+sudo service mysql start           # Ubuntu / Debian
+net start MySQL80                  # Windows (service name may differ)
 ```
 
 Create the database, tables and demo data:
@@ -122,7 +143,59 @@ This command:
 2. Drops and recreates the project tables.
 3. Loads the demo users, project, agents, tasks, dependencies, runs, artifacts and reviews.
 
-The main database definition is in `database/schema.sql`; the initial data is in `database/seed.sql`.
+The main database definition is in `database/schema.sql`; the initial data is in `database/seed.sql`. Running `npm run db:setup` again resets the database to the demo data.
+
+### Manual alternative
+
+If you prefer the MySQL client, the same result is:
+
+```bash
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS agentops CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+mysql -u root -p agentops < database/schema.sql
+mysql -u root -p agentops < database/seed.sql
+```
+
+Use the same database name as `DB_NAME` in `.env`.
+
+### Check the data
+
+```sql
+USE agentops;
+SELECT 'users', COUNT(*) FROM users
+UNION ALL SELECT 'projects', COUNT(*) FROM projects
+UNION ALL SELECT 'agents', COUNT(*) FROM agents
+UNION ALL SELECT 'tasks', COUNT(*) FROM tasks
+UNION ALL SELECT 'task_dependencies', COUNT(*) FROM task_dependencies
+UNION ALL SELECT 'task_assignments', COUNT(*) FROM task_assignments
+UNION ALL SELECT 'agent_runs', COUNT(*) FROM agent_runs
+UNION ALL SELECT 'artifacts', COUNT(*) FROM artifacts
+UNION ALL SELECT 'reviews', COUNT(*) FROM reviews
+UNION ALL SELECT 'run_inputs', COUNT(*) FROM run_inputs;
+```
+
+Expected counts after a fresh setup:
+
+| Table | Rows |
+|---|---|
+| users | 2 |
+| projects | 1 |
+| agents | 4 |
+| tasks | 6 |
+| task_dependencies | 5 |
+| task_assignments | 2 |
+| agent_runs | 2 |
+| artifacts | 2 |
+| reviews | 2 |
+| run_inputs | 1 |
+
+### Common setup problems
+
+- `ER_ACCESS_DENIED_ERROR`: `DB_USER` / `DB_PASSWORD` in `.env` do not match your MySQL account.
+- `ECONNREFUSED`: MySQL is not running, or `DB_HOST` / `DB_PORT` are wrong.
+- `EADDRINUSE`: port 3000 is taken; set another `PORT` in `.env`.
+- Login fails: run `npm run db:setup` again to restore the demo accounts.
+
+More cases are covered in `docs/RELATIONSHIPS_AND_TESTING.md`, section 10.
 
 ## Run the application
 
@@ -290,4 +363,4 @@ The unit test checks the text similarity function used for duplicate-task detect
 - **ER diagram (10%)**: users, projects, tasks, dependencies, agents, runs, artifacts and reviews.
 - **Key SQL (15%)**: joins, dependency blocking, agent performance and full execution trace.
 - **Video (25%)**: live CRUD and database changes while agents run.
-- **Organization / participation (10%)**: run history, artifact viewer and a repeatable 5-minute demo flow.
+- **Organization / participation (10%)**: a 5-minute presentation in which every member speaks, with the 2-minute demo video inside that time; speaker notes in the slides split the talk into five parts.
