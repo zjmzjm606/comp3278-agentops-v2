@@ -20,6 +20,11 @@ Sign in with `alice@example.com` / `password123`. No API key is needed: agents r
 
 Each step is explained below, including a manual alternative for the database setup and a query to check that the data loaded.
 
+## Presentation
+
+- Slides: [`presentation/Group_16_slides.pptx`](presentation/Group_16_slides.pptx) (speaker notes are included)
+- Demo video (about 90 seconds, English voice-over and subtitles): [`presentation/Group_16_video.mp4`](presentation/Group_16_video.mp4)
+
 ## What the app does
 
 - Create and manage projects.
@@ -58,6 +63,9 @@ Each step is explained below, including a manual alternative for the database se
 │   ├── er_diagram_chen.png # Chen-notation ER diagram (image)
 │   ├── KEY_QUERIES.sql     # Queries used in the presentation
 │   └── RELATIONSHIPS_AND_TESTING.md  # Full relationship matrix and test plan
+├── presentation/
+│   ├── Group_16_slides.pptx # Presentation slides with speaker notes
+│   └── Group_16_video.mp4   # Demo video
 ├── public/
 │   ├── index.html
 │   ├── styles.css
